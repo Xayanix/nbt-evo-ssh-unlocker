@@ -1,51 +1,149 @@
-# NBT EVO Reversing Work
-Some notes on FSC certstore patching
+# NBT-Evo SSH Unlocker
 
-## Background & process
-Unlike FDL coding FSC coding involves giving the NBT unit a certificate signed by BMW that it checks against a public key stored on the device.
+A small, user-friendly GUI that enables debug access (SSH / telnet / qconn) on a
+BMW **NBT-Evo** head unit. It flashes a patched `starter.cfg` (OPT_DEBUG
+`STOP` -> `RUN`) directly to the unit's live partition over the diagnostic
+network, and can also restore the stock config.
 
-Getting the device to accept a self-signed FSC code can be accomplished a few ways:
-  * Computing BMW's signing key and being able to sign valid FSCs (unlikely, until quantum computers)
-  * Disabling signature validation (lots of RE work, app decompilation etc)
-  * Replacing the on-device public key with our own (<== our method, less RE work)
+> **Use at your own risk.** This writes to a unit inside a real car. A wrong or
+> version-mismatched file can leave the head unit unable to boot. Recover with
+> **Restore factory (revert)** first, then serial/eMMC as the last resort.
 
-So the trick becomes, how do we get write access to the NBT in order to overwrite the pubkey with our own?
+This tool **only enables SSH/debug access**. It does not touch certificates or
+FSC codes (see [Background](#background)).
 
-The flashing (software update) process for the NBT works like this:
-1. Diag session opened, flashing mode session opened, device reboots to bootloader
-2. E-sys flashes software to a secondary partition
-3. Secondary partition software is checksummed + validated, then promoted to primary boot partition
+---
 
-But the write location is determined by the client, and since the checksumming + validation only happens when a partition is promoted, we can just write to the primary partition and not worry about signatures.
+## What it does
 
-We can craft an SWFL that targets *just* the certificate modulus (128 bytes) on the primary partition. There's a brick risk if we overwrite the wrong space since we're targeting live, but worst case we can restore the unit from boot mode.
+- Reaches the HU flash bootloader over BMW **HSFZ** (TCP 6801; discovery via
+  UDP broadcast on 6811).
+- Performs UDS `SecurityAccess 0x27` Level 3 using the inlined L3 key.
+- Writes the OPT_DEBUG `starter.cfg` with **LIVE-DIRECT** file copy (no
+  signature record, so the SWDL signature check is bypassed).
+- After the reboot, `sshd` (22), `telnetd` (23) and `qconn` (8000) come up as
+  **root** over OBD/ENET.
 
-Once applied we just need to understand the format of the FSC file and replace the signatures with our own - then e-sys will apply them via the factory routines and they will be accepted by the NBT.
+Supported: **NBT-Evo 007.xxx** family (`007_001_016 / 030 / 039 / 049 / 051`).
+**Do NOT use on a `001_05x` unit** (different `starter.cfg`).
 
-## Prep: CA creation
-Step one here will be to create our own CA that we'll sign the FSC files with. It should be RSA-1024 with e=3 to match the format of what's there:
+---
+
+## Requirements
+
+- Windows 10/11 (the GUI uses Tkinter, which ships with Python on Windows).
+- Python 3.12 (any recent Python 3 works).
+- ENET/OBD cable and a network adapter with a `169.254.x.x` link-local address.
+- The HU powered and reachable (ignition/terminal state as required by your setup).
+- Allow Python through the Windows firewall when prompted.
+
+Install Python with winget if needed:
+
+```powershell
+winget install --id Python.Python.3.12 -e --source winget
 ```
-# generate CA
-openssl genrsa -3 -out nbt-ca.pem 1024
 
-# get the modulus and print it little-endian
-openssl rsa -in nbt-ca.pem -noout -modulus | sed 's/^Modulus=//' | fold -w2 | tac | tr -d '\n' | xxd -r -p > nbt-ca.modulus.bin
+Then open a **new** terminal so `python` / `py` resolve to the new install.
 
-# sanity check that this is 128b
-wc -c < nbt-ca.modulus.bin
-```
+---
 
-## Flash NBT to enable debug mode (ssh)
-Above we described a process in which we could overwrite arbitrary parts of the filesystem. For speed and reliability we will flash a much smaller change (enable ssh) and apply our cert overwrite over SSH
-`./nbt_optdebug_flash.py` includes the OPT_DEBUG enable override inline and will handle the obd/enet parts of flashing for you
+## Quick start
 
-## Apply our CA to the NBT
-With SSH enabled we can copy our CA modulus over and overwrite the one in NBT
-`ssh root@169.254.199.119 'cat > /var/userca.bin' < "$TARGETBIN"`
+1. Put both files in the same folder:
+   - `nbt_ssh_unlock_gui.py` (the GUI)
+   - `nbt_optdebug_flash.py` (the flasher it wraps)
+2. Start the GUI:
+   - double-click `Start_SSH_Unlock.bat`, or
+   - run `python nbt_ssh_unlock_gui.py`
+3. Click **Offline self-test** first. You should see `ALL PASS`.
+4. Connect the ENET cable and make sure your adapter has a `169.254.x.x` address.
+5. Click **Detect** (or type the gateway IP) and then **Test**. A valid unit
+   returns its VIN.
+6. Tick **I understand the risk**.
+7. Click **Unlock SSH** and type `UNLOCK` to confirm.
+8. Wait ~50 seconds for the HU to reboot, then connect:
 
-now overwrite the stock ca
-`ssh root@169.254.199.119 "mount -u -o rw /fs/sda0 && dd if=/var/userca.bin of=/fs/sda0/opt/car/bin/NBTCarHU bs=1 seek=0x35A300 count=128 conv=notrunc && sync && mount -u -o ro /fs/sda0"`
+   ```
+   ssh root@169.254.199.119
+   ```
 
+   Ports `22`, `23` (telnet) and `8000` (qconn) are open; user `root`, no password.
 
-## Generate FSC codes from our CA
-...continued later
+---
+
+## Restoring the factory config
+
+If the unit misbehaves after unlocking, or you simply want to close SSH again:
+
+1. Connect to the unit the same way.
+2. Tick the safety checkbox.
+3. Click **Restore factory (revert)** and type `REVERT`.
+4. Wait for the reboot and verify that SSH/telnet/qconn are closed.
+
+The revert uses the same LIVE-DIRECT path and writes the byte-exact stock
+`starter.cfg`.
+
+---
+
+## Advanced fields
+
+Leave these at their defaults unless you know what you are doing.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| Gateway address | *(empty)* | Empty = auto-discover via the 6811 broadcast; falls back to `169.254.199.99`. |
+| Port | `6801` | HSFZ diagnostic port. |
+| LBN (hex) | `0` | Logical block number for erase / checkMemory. |
+| Tester ID (hex) | `00000000` | UDS tester address used in the L3 seed signature. |
+| Controller (hex) | `00001ffd` | Bootloader controller ID (NBT-Evo BTLD `00001FFD`). |
+| Fingerprint (hex) | `00` x 13 | Fingerprint written with `2E F15A`. |
+| Reset timeout (s) | `50` | How long to wait for the HU to reappear in programming session. |
+
+---
+
+## How it works (short version)
+
+1. Enter the flash bootloader: `10 03` -> `31 01 0F0C 03` (EnergyMode=Flash) ->
+   `10 02` (programming session). The HU reboots into the bootloader.
+2. Authenticate with `27 11` / `27 12`. The key is the L3 BMWSigVerify signature
+   over `MD5([UserID][Controller][seed])` (RSA-1024, e=3).
+3. SWDL write: `31 FF00` erase, `34` requestDownload, `36` transferData,
+   `37` transferExit, `31 0202` checkMemory.
+4. The container targets `/fs/sda0/opt/sys/etc/starter.cfg` **LIVE-DIRECT** and
+   carries no signature record, so it is applied to the running filesystem.
+5. Finalize: ActivateApplicationMode, clear Energy/ExtendedMode, reset.
+
+The offline **self-test** verifies the L3 key modulus hash, signs test seeds,
+and checks the SHA-256 of both inlined containers before any car is touched.
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+| --- | --- |
+| `No gateway detected` | Check the ENET cable, adapter link-local address (`169.254.x.x`), and firewall. |
+| Detect works but **Test** fails | Confirm the gateway IP/port and that nothing blocks TCP 6801. |
+| Flash aborted | Nothing was written; the existing `starter.cfg` is intact. Check the log. |
+| Unit does not boot after unlock | Run **Restore factory (revert)**; if that is impossible, recover over serial/eMMC. |
+| Self-test fails | One of the bundled blobs/key is corrupted; re-download the tool. |
+
+---
+
+## Background
+
+Unlike FDL coding, FSC coding requires a certificate signed by BMW that the NBT
+checks against a public key stored on the device. One way to make the unit
+accept a self-signed FSC is to replace the on-device public key with your own
+CA, then sign FSCs yourself. Enabling SSH is the first step: it gives write
+access to the filesystem so the CA modulus can be replaced, after which e-sys
+can apply your own FSC codes. See the original reversing notes in the repository
+history for the certificate-format details.
+
+---
+
+## Disclaimer
+
+This project is for research and personal use on hardware you own. You are
+responsible for complying with local laws and for any damage to your vehicle or
+head unit. There is no warranty.
