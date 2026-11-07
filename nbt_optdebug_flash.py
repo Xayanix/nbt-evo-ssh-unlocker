@@ -246,7 +246,7 @@ HU = ADDR_HU
 EXT_SESSION  = bytes([0x10, 0x03]); PROG_SESSION = bytes([0x10, 0x02]); HARD_RESET = bytes([0x11, 0x01])
 ENERGY_ON = bytes.fromhex("31010F0C03"); ENERGY_OFF = bytes.fromhex("31010F0C00")
 DTC_OFF = bytes.fromhex("8502"); DTC_ON = bytes.fromhex("8501")
-COMM_QUIET = bytes.fromhex("280101"); COMM_NORMAL = bytes.fromhex("280001")
+COMM_QUIET = bytes.fromhex("280301"); COMM_NORMAL = bytes.fromhex("280001")
 EXT_SET_01 = bytes.fromhex("3101100301"); EXT_SET_OFF = bytes.fromhex("3101100300")
 ACT_APP_MODE = bytes.fromhex("3101100F")
 READ_ENERGY = bytes.fromhex("22100A"); READ_EXTMODE = bytes.fromhex("22100E")
@@ -286,9 +286,9 @@ def enter_progmode(h, reset_timeout, log=print):
         log("  *** EnergyMode not set — abort. ***"); return False
     log("== STEP 3: DTC off + CommunicationControl quiet ==")
     _gtx(h, DTC_OFF, "85 02 ControlDTCSetting off", log)
-    r = _gtx(h, COMM_QUIET, "28 01 01 CommControl quiet", log)
+    r = _gtx(h, COMM_QUIET, "28 03 01 CommControl quiet", log)
     if r is not None and is_neg(r) and len(r) > 2 and r[2] == 0x22:
-        log("  *** 28 01 01 -> 0x22 (unexpected) ***")
+        log("  *** 28 03 01 -> 0x22 (unexpected) ***")
     _gtx(h, READ_RASS, "22 F100 sub-state", log)
     log("== STEP 4: SetExtendedMode (31 01 1003 01) ==")
     r = _gtx(h, EXT_SET_01, "31 01 1003 01 SetExtMode", log)
@@ -330,32 +330,52 @@ def _reopen(h):
     try: h.open()
     except Exception: pass
 
+def _read_state(h, label, log):
+    """22 F186 -> HU state byte (01 app, 02 programming/bootloader, 03 flash transition)."""
+    r = _gtx(h, READ_ADS, label, log)
+    return r[3] if _ispos(r) and r[0] == 0x62 and len(r) >= 4 else None
+
 def teardown(h, log=print):
-    """Restore the HU app: ActivateApplicationMode first (consumes the EnergyMode settle window), then
-       clear EnergyMode/ExtendedMode, restore comms/DTC, reset only when both registers are clean."""
+    """Restore the HU app after any abort.
+       Never wait for session 0x01 while EnergyMode is still Flash: in that state the HU
+       cannot return to the app on its own, so the old code deadlocked and left the unit on
+       a black screen. Clear EnergyMode/ExtendedMode first, then reset. If the registers do
+       not read back clean we still force a reset — leaving the HU in EnergyMode=Flash is a
+       guaranteed black screen, while a reset lets it boot the app again."""
     log("== TEARDOWN: restore HU to normal app ==")
-    _reopen(h); _gtx(h, ACT_APP_MODE, "31 01 100F ActAppMode", log); _reopen(h)
-    t0 = time.time()
-    while time.time() - t0 < 40:
-        time.sleep(2.0); _reopen(h)
-        r = _gtx(h, READ_ADS, "22 F186 (await app)", log)
-        if _ispos(r) and r[0] == 0x62 and len(r) >= 4 and r[3] == 0x01:
-            log("  [..] back in app (session 01) after %.0fs" % (time.time() - t0)); break
-    en_ok = False; t0 = time.time()
-    while time.time() - t0 < 50:
+    _reopen(h); _gtx(h, ACT_APP_MODE, "31 01 100F ActAppMode", log)
+    en_ok = ext_ok = False; st = None
+    for _ in range(6):
         _reopen(h)
-        _gtx(h, EXT_SESSION, "10 03", log)
+        _gtx(h, EXT_SESSION, "10 03 ExtendedSession", log)
         _gtx(h, ENERGY_OFF, "31 01 0F0C 00 EnergyOff", log)
-        if _val(_gtx(h, READ_ENERGY, "22 100A EnergyMode", log)) == 0x00:
-            en_ok = True; log("  [..] EnergyMode cleared after %.0fs" % (time.time() - t0)); break
-        time.sleep(3.0)
-    _gtx(h, EXT_SET_OFF, "31 01 1003 00 ExtModeOff", log)
+        en_ok = (_val(_gtx(h, READ_ENERGY, "22 100A EnergyMode", log)) == 0x00)
+        _gtx(h, EXT_SET_OFF, "31 01 1003 00 ExtModeOff", log)
+        ext_ok = (_val(_gtx(h, READ_EXTMODE, "22 100E ExtendedMode", log)) == 0x00)
+        st = _read_state(h, "22 F186 (state)", log)
+        if (en_ok and ext_ok) or st == 0x01:
+            break
+        time.sleep(2.0)
     _gtx(h, COMM_NORMAL, "28 00 01 CommNormal", log)
     _gtx(h, DTC_ON, "85 01 DTC on", log)
-    ext_ok = (_val(_gtx(h, READ_EXTMODE, "22 100E ExtendedMode", log)) == 0x00)
-    if en_ok and ext_ok:
+    if (en_ok and ext_ok) or st == 0x01:
         _gtx(h, HARD_RESET, "11 01 reset -> clean app", log); return True
-    log("  *** NOT clean (energy=%s ext=%s) — NOT resetting. ***" % ("00" if en_ok else "!=00", "00" if ext_ok else "!=00"))
+    log("  *** NOT clean (energy=%s ext=%s state=%s) — forcing reset to exit flash mode. ***"
+        % ("00" if en_ok else "!=00", "00" if ext_ok else "!=00", "?" if st is None else "0x%02X" % st))
+    _gtx(h, HARD_RESET, "11 01 reset (force exit flash mode)", log)
+    try: h.close()
+    except Exception: pass
+    t0 = time.time()
+    while time.time() - t0 < 25:
+        time.sleep(2.0)
+        try:
+            h.open()
+            if _read_state(h, "22 F186 (after reset)", log) == 0x01:
+                log("  [..] back in app (session 01) after force reset (%.0fs)" % (time.time() - t0)); return True
+        except Exception:
+            try: h.close()
+            except Exception: pass
+    log("  *** HU did not confirm app session after reset. ***")
     return False
 
 # ===================================================================== apply (port of nbt_apply)
@@ -577,7 +597,7 @@ def main():
 
     if not a.commit:
         print("\nDRY-RUN (no --commit) — transmitting nothing. Planned sequence:")
-        for ln in ["[enter bolo] 10 03 -> 0F0C 03 -> 85 02 -> 28 01 01 -> 1003 01 -> 10 02 -> poll 22 F186==02",
+        for ln in ["[enter bolo] 10 03 -> 0F0C 03 -> 85 02 -> 28 03 01 -> 1003 01 -> 10 02 -> poll 22 F186==02",
                    "27 11 / sign MD5([UserID %s][Controller %s][seed]) / 27 12  -> REQUIRE 67 12" % (tester_id.hex(), controller.hex()),
                    "[tp] background TesterPresent 3E 80 -> 0xDF every ~1.0s",
                    "2E F15A %s" % fingerprint.hex(),
